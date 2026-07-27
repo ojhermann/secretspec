@@ -218,6 +218,11 @@ impl Provider for DotEnvProvider {
         })
     }
 
+    /// Scope-collapsing: a flat `KEY=value` file has no hierarchy to hold project/profile, so the convention address is the key alone.
+    fn convention_collapses_scope(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         Self::PROVIDER_NAME
     }

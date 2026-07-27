@@ -138,6 +138,11 @@ impl Provider for SystemdCredentialProvider {
         })
     }
 
+    /// Scope-collapsing: systemd passes credentials by name alone, so the convention address is the key alone.
+    fn convention_collapses_scope(&self) -> bool {
+        true
+    }
+
     fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
         let name = super::flat_item(self, addr)?;
         let path = self.credential_path(&name)?;

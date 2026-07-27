@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Injected credentials read through a private, owner-only `dcli` state
   directory of their own, because `dcli` otherwise prefers a device already
   registered on the machine and reads that identity's vault instead.
+- The `Provider` trait gains two defaulted methods describing how a store names
+  secrets: `is_valid_native_name` (which names the store accepts) and
+  `convention_collapses_scope` (whether the convention address drops
+  `{project}/{profile}`). Both have defaults, so existing provider
+  implementations are unaffected.
 
 ## [0.17.0] - 2026-07-26
 

@@ -525,6 +525,15 @@ impl Provider for AkvProvider {
         })
     }
 
+    /// Azure Key Vault accepts only letters, digits and hyphens, 1-127 chars.
+    /// This is the restriction the Base32 encoding in
+    /// [`format_secret_name`](Self::format_secret_name) exists to satisfy.
+    fn is_valid_native_name(&self, item: &str) -> bool {
+        !item.is_empty()
+            && item.len() <= 127
+            && item.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    }
+
     fn with_credentials(&mut self, credentials: ProviderCredentials) {
         self.credentials = credentials;
     }

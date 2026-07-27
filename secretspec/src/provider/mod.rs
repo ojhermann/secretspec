@@ -592,6 +592,32 @@ pub trait Provider: Send + Sync {
     /// this store (e.g. empty components, length limits).
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress>;
 
+    /// Whether `item` is a name this store will accept.
+    ///
+    /// Declared so the naming invariants can be quantified over every registered
+    /// provider rather than restated per store: the shared property test asks
+    /// each provider what it accepts, instead of hard-coding one store's rule.
+    /// The default admits any non-empty name, which is the honest claim for a
+    /// store that imposes no charset of its own (a filesystem path, a keyring
+    /// label). Stores with a real restriction override it — see
+    /// [`AkvProvider`](crate::provider::akv::AkvProvider), whose Base32 scheme
+    /// exists precisely to satisfy one.
+    fn is_valid_native_name(&self, item: &str) -> bool {
+        !item.is_empty()
+    }
+
+    /// Whether [`convention_address`](Provider::convention_address) drops the
+    /// `{project}/{profile}` scope and addresses by key alone.
+    ///
+    /// True for stores with no hierarchy to put it in — `dotenv` and `env` are
+    /// a flat map of names, `bws` a flat project. Such a store cannot be
+    /// injective over the full triple by construction (two profiles map to one
+    /// name), so the shared injectivity property skips it rather than asserting
+    /// something false of it.
+    fn convention_collapses_scope(&self) -> bool {
+        false
+    }
+
     /// The optional [`NativeAddress`] coordinates this store can honor, beyond
     /// the universally consumed `item` (e.g. `["field"]`).
     ///
@@ -939,6 +965,12 @@ pub(crate) fn get_each<P: Provider + ?Sized>(
 impl<T: Provider> Provider for std::sync::Arc<T> {
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
         (**self).convention_address(project, profile, key)
+    }
+    fn is_valid_native_name(&self, item: &str) -> bool {
+        (**self).is_valid_native_name(item)
+    }
+    fn convention_collapses_scope(&self) -> bool {
+        (**self).convention_collapses_scope()
     }
     fn supported_coords(&self) -> &'static [&'static str] {
         (**self).supported_coords()
@@ -1648,4 +1680,158 @@ mod encoding_properties {
             );
         }
     }
+}
+
+/// The naming invariants, quantified over **every registered provider**.
+///
+/// The store-specific properties live with their store (see
+/// [`akv::name_properties`], whose Base32 round-trip needs knowledge of that
+/// scheme). What is stated here is what the [`Provider`] contract claims of
+/// *all* of them, so a provider added later inherits the checks without
+/// anyone remembering to write them.
+///
+/// Providers are constructed offline: the registry factory only parses the URI,
+/// and the auth probe lives in a separate `preflight` closure that is never
+/// called here. No network, no credentials.
+#[cfg(test)]
+mod naming_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A convention component, drawn from the domain a provider must cope with.
+    ///
+    /// The second arm is the same deliberate bias as [`akv::name_properties`]:
+    /// collisions in delimiter-joined schemes live in the separator characters,
+    /// and an unbiased alphanumeric generator reaches that region far too
+    /// rarely to find one.
+    fn component() -> impl Strategy<Value = String> {
+        prop_oneof!["[A-Za-z0-9_-]{1,8}", "[_-]{1,3}"]
+    }
+
+    fn triple() -> impl Strategy<Value = (String, String, String)> {
+        (component(), component(), component())
+    }
+
+    /// Every registered provider, constructed from its own first example URI.
+    fn each_provider() -> Vec<(&'static str, Box<dyn Provider>)> {
+        PROVIDER_REGISTRY
+            .iter()
+            .filter_map(|reg| {
+                let example = reg.info.examples.first()?;
+                let url = ProviderUrl::new(Url::parse(example).ok()?);
+                let built = (reg.factory)(&url, ProviderCredentials::new()).ok()?;
+                Some((reg.info.name, built.provider))
+            })
+            .collect()
+    }
+
+    proptest! {
+        /// A convention address is a pure function of its inputs.
+        ///
+        /// Provider URIs are rendered into audit records that are compared, so
+        /// an address that varied per call would make two identical resolutions
+        /// look like different ones.
+        #[test]
+        fn convention_addresses_are_deterministic((project, profile, key) in triple()) {
+            for (name, provider) in each_provider() {
+                let once = provider.convention_address(&project, &profile, &key);
+                let twice = provider.convention_address(&project, &profile, &key);
+                prop_assert_eq!(
+                    once.as_ref().ok().map(|a| &a.item),
+                    twice.as_ref().ok().map(|a| &a.item),
+                    "{} produced two different addresses for the same triple",
+                    name,
+                );
+            }
+        }
+
+        /// A provider never builds a name its own store would reject.
+        ///
+        /// This is the invariant akv's Base32 scheme was written to satisfy.
+        /// Stated on the trait, it now holds every provider to it -- including
+        /// ones that do not exist yet.
+        #[test]
+        fn convention_addresses_are_legal_names((project, profile, key) in triple()) {
+            for (name, provider) in each_provider() {
+                let Ok(addr) = provider.convention_address(&project, &profile, &key) else {
+                    // Refusing the triple outright is fine; producing an
+                    // illegal name is not.
+                    continue;
+                };
+                prop_assert!(
+                    provider.is_valid_native_name(&addr.item),
+                    "{} built {:?} from ({:?}, {:?}, {:?}), which it rejects as a name",
+                    name, addr.item, project, profile, key,
+                );
+            }
+        }
+
+        /// Distinct triples reach distinct addresses, over **re-associated**
+        /// pairs: the same characters with one component boundary moved.
+        ///
+        /// Sampling two independent triples is the obvious phrasing and a bad
+        /// test -- two random triples essentially never collide, so it passes
+        /// against a scheme that is provably not injective. (The same trap
+        /// [`akv::name_properties`] avoids by testing a left inverse; that
+        /// needs knowledge of the scheme, so it cannot be written generically.)
+        ///
+        /// A delimiter-joining scheme fails on exactly one shape: when a
+        /// component contains the delimiter, `(a+d+b, c, k)` and `(a, b+d+c, k)`
+        /// join to one string. Generating that shape directly is what gives this
+        /// property teeth against every joining store at once.
+        ///
+        /// The delimiter is drawn from `-_` -- the characters that occur in
+        /// ordinary project and profile names. `/` also collides, in every
+        /// store that joins with it, but only for a component that itself
+        /// contains `/`; nothing validates project and profile names today, so
+        /// that is reachable but requires a deliberately odd name. Widening
+        /// this generator is the right move once components have a validated
+        /// charset -- see the PR discussion.
+        ///
+        /// A collision means one store slot serves two secrets: a read returns
+        /// another profile's value, a write silently destroys it. Stores that
+        /// address by key alone are exempt by construction and say so via
+        /// [`Provider::convention_collapses_scope`].
+        #[test]
+        fn re_associated_triples_never_collide(
+            a in component(),
+            delim in "[-_]",
+            b in component(),
+            c in component(),
+            key in component(),
+        ) {
+            let left = (format!("{a}{delim}{b}"), c.clone(), key.clone());
+            let right = (a.clone(), format!("{b}{delim}{c}"), key.clone());
+            prop_assume!(left != right);
+
+            for (name, provider) in each_provider() {
+                if provider.convention_collapses_scope() || KNOWN_COLLIDING.contains(&name) {
+                    continue;
+                }
+                let (Ok(x), Ok(y)) = (
+                    provider.convention_address(&left.0, &left.1, &left.2),
+                    provider.convention_address(&right.0, &right.1, &right.2),
+                ) else {
+                    continue;
+                };
+                prop_assert_ne!(
+                    &x.item, &y.item,
+                    "{} maps {:?} and {:?} onto one name {:?}",
+                    name, left, right, x.item,
+                );
+            }
+        }
+    }
+
+    /// Providers with a known, pre-existing collision, exempted so the property
+    /// can guard everyone else in the meantime.
+    ///
+    /// `gcsm` joins with `-` and admits `-` inside a component, so
+    /// `("a-b", "c", "K")` and `("a", "b-c", "K")` both address
+    /// `secretspec-a-b-c-K`. This is the same defect the akv Base32 scheme was
+    /// introduced to fix, and the fix has the same cost: it moves where existing
+    /// secrets live, so it is a breaking storage change rather than something to
+    /// slip into a test PR. Raised for a maintainer decision -- remove the entry
+    /// with the fix.
+    const KNOWN_COLLIDING: &[&str] = &["gcsm"];
 }
