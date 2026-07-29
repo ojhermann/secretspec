@@ -556,6 +556,11 @@ impl Provider for SopsProvider {
         })
     }
 
+    /// Scope-collapsing: project and profile select the encrypted file, and the convention address is the key alone within it.
+    fn convention_collapses_scope(&self) -> bool {
+        true
+    }
+
     fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
         let parts = self.address_parts(addr)?;
         let Some(path) = self.resolve_file_path(parts.project, parts.profile)? else {
