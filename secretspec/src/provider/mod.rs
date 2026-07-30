@@ -1723,16 +1723,34 @@ mod naming_properties {
     }
 
     /// Every registered provider, constructed from its own first example URI.
+    ///
+    /// A provider that cannot be built is named rather than skipped: dropping
+    /// one leaves every property below still passing, over a smaller set.
     fn each_provider() -> Vec<(&'static str, Box<dyn Provider>)> {
-        PROVIDER_REGISTRY
-            .iter()
-            .filter_map(|reg| {
-                let example = reg.info.examples.first()?;
-                let url = ProviderUrl::new(Url::parse(example).ok()?);
-                let built = (reg.factory)(&url, ProviderCredentials::new()).ok()?;
-                Some((reg.info.name, built.provider))
-            })
-            .collect()
+        let mut built = Vec::new();
+        let mut unbuildable = Vec::new();
+
+        for reg in PROVIDER_REGISTRY.iter() {
+            let provider = reg
+                .info
+                .examples
+                .first()
+                .and_then(|example| Url::parse(example).ok())
+                .and_then(|url| {
+                    (reg.factory)(&ProviderUrl::new(url), ProviderCredentials::new()).ok()
+                });
+            match provider {
+                Some(pwp) => built.push((reg.info.name, pwp.provider)),
+                None => unbuildable.push(reg.info.name),
+            }
+        }
+
+        assert!(
+            unbuildable.is_empty(),
+            "no first example URI builds these providers, so the naming \
+             properties never see them: {unbuildable:?}"
+        );
+        built
     }
 
     proptest! {
