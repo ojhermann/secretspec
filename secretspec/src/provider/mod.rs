@@ -1132,6 +1132,16 @@ impl Provider for PreflightGuard {
         self.inner.convention_address(project, profile, key)
     }
 
+    // Both describe the inner store, and `provider_from_url` hands out this
+    // guard rather than the provider, so the defaults would answer for it.
+    fn is_valid_native_name(&self, item: &str) -> bool {
+        self.inner.is_valid_native_name(item)
+    }
+
+    fn convention_collapses_scope(&self) -> bool {
+        self.inner.convention_collapses_scope()
+    }
+
     fn supported_coords(&self) -> &'static [&'static str] {
         self.inner.supported_coords()
     }
