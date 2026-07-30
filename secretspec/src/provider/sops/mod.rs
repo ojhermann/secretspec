@@ -556,7 +556,8 @@ impl Provider for SopsProvider {
         })
     }
 
-    /// Scope-collapsing: project and profile select the encrypted file, and the convention address is the key alone within it.
+    /// Scope-collapsing: project and profile select the encrypted file, and
+    /// the convention address is the key alone within it.
     fn convention_collapses_scope(&self) -> bool {
         true
     }

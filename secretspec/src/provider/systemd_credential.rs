@@ -138,7 +138,8 @@ impl Provider for SystemdCredentialProvider {
         })
     }
 
-    /// Scope-collapsing: systemd passes credentials by name alone, so the convention address is the key alone.
+    /// Scope-collapsing: systemd passes credentials by name alone, so the
+    /// convention address is the key alone.
     fn convention_collapses_scope(&self) -> bool {
         true
     }

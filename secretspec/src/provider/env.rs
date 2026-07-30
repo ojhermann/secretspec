@@ -126,7 +126,8 @@ impl Provider for EnvProvider {
         })
     }
 
-    /// Scope-collapsing: process environment variables are a flat namespace, so the convention address is the key alone.
+    /// Scope-collapsing: process environment variables are a flat namespace,
+    /// so the convention address is the key alone.
     fn convention_collapses_scope(&self) -> bool {
         true
     }

@@ -335,7 +335,8 @@ impl Provider for BwsProvider {
         })
     }
 
-    /// Scope-collapsing: a Bitwarden Secrets Manager project is a flat key space, so the convention address is the key alone.
+    /// Scope-collapsing: a Bitwarden Secrets Manager project is a flat key
+    /// space, so the convention address is the key alone.
     fn convention_collapses_scope(&self) -> bool {
         true
     }

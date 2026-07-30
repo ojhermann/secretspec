@@ -338,7 +338,8 @@ impl Provider for AgeProvider {
         })
     }
 
-    /// Scope-collapsing: the encrypted file is a flat map of key to value, so the convention address is the key alone.
+    /// Scope-collapsing: the encrypted file is a flat map of key to value, so
+    /// the convention address is the key alone.
     fn convention_collapses_scope(&self) -> bool {
         true
     }
