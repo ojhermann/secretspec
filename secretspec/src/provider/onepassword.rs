@@ -1,4 +1,6 @@
-use crate::provider::{Address, Provider, ProviderCredentials, ProviderUrl, credential_or_env};
+use crate::provider::{
+    Address, NameTemplate, Provider, ProviderCredentials, ProviderUrl, credential_or_env,
+};
 use crate::{Result, SecretSpecError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -207,6 +209,11 @@ impl TryFrom<&ProviderUrl> for OnePasswordConfig {
             )));
         }
 
+        // The path names the vault here, so this provider had no URI spelling
+        // for its item-title template at all: `folder_prefix` was reachable
+        // from the Rust API only. `?template=` is that spelling.
+        config.folder_prefix = crate::provider::template_from_url(url, None, "the URI path")?;
+
         Ok(config)
     }
 }
@@ -309,6 +316,9 @@ fn strip_op_session_env(cmd: &mut Command) {
 pub struct OnePasswordProvider {
     /// Configuration for the provider including auth settings and default vault.
     config: OnePasswordConfig,
+    /// Item title template, settable through the Rust API only: the URI's path
+    /// names the vault, so there is nowhere in it to spell a template.
+    template: NameTemplate,
     /// The OnePassword CLI command to use (either "op" or a custom path).
     op_command: String,
     /// Credentials supplied by the provider alias.
@@ -343,8 +353,14 @@ impl OnePasswordProvider {
                 "op".to_string()
             }
         });
+        let template = config
+            .folder_prefix
+            .as_deref()
+            .map(NameTemplate::new)
+            .unwrap_or_default();
         Self {
             config,
+            template,
             op_command,
             credentials: ProviderCredentials::new(),
         }
@@ -688,32 +704,14 @@ impl OnePasswordProvider {
             .map(|item| item.id))
     }
 
-    /// Formats the item name for storage in OnePassword.
+    /// The item title a convention address resolves to, rendered from the
+    /// folder-prefix template.
     ///
-    /// Creates a hierarchical name using the folder_prefix format string.
-    /// Supports placeholders: {project}, {profile}, and {key}.
-    /// Defaults to "secretspec/{project}/{profile}/{key}" if not configured.
-    ///
-    /// # Arguments
-    ///
-    /// * `project` - The project name
-    /// * `key` - The secret key
-    /// * `profile` - The profile name
-    ///
-    /// # Returns
-    ///
-    /// A formatted string based on the configured pattern
+    /// Kept as a helper because item *creation* needs the title before there is
+    /// an address to resolve, and takes its arguments in the CLI's
+    /// `(project, key, profile)` order.
     fn format_item_name(&self, project: &str, key: &str, profile: &str) -> String {
-        let format_string = self
-            .config
-            .folder_prefix
-            .as_deref()
-            .unwrap_or("secretspec/{project}/{profile}/{key}");
-
-        format_string
-            .replace("{project}", project)
-            .replace("{profile}", profile)
-            .replace("{key}", key)
+        self.template.render(project, profile, key)
     }
 
     /// Creates a template for a new OnePassword item.
@@ -809,18 +807,44 @@ impl OnePasswordProvider {
 }
 
 impl Provider for OnePasswordProvider {
-    /// Convention items are titled by the folder-prefix format string,
+    fn name_template(&self) -> &NameTemplate {
+        &self.template
+    }
+
+    /// Convention items are titled by the folder-prefix template,
     /// `secretspec/{project}/{profile}/{key}` by default, in the store's
     /// default vault, and read like whole-item references: the `value` field
     /// first, then password/concealed fields.
+    ///
+    /// Overridden to name that vault, which the rendered title does not carry,
+    /// and to refuse a template this store cannot address unambiguously.
+    ///
+    /// The mechanism is uniform across providers; safety is not. 1Password
+    /// addresses by *title*, and titles are not unique within a vault: `op`
+    /// resolves a duplicate by returning the first match, so a template that
+    /// renders the same title for two different projects or profiles reads an
+    /// unrelated item rather than failing. Where the URI names a per-project
+    /// container — a KDBX file, a `pass` store — dropping those segments merely
+    /// flattens the layout; here it silently crosses projects, so it is
+    /// refused.
     fn convention_address(
         &self,
         project: &str,
         profile: &str,
         key: &str,
     ) -> Result<crate::config::NativeAddress> {
+        if !self.template.scopes_by_project_or_profile() {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "the 1Password naming template `{}` renders the same item title for every \
+                 project and profile sharing vault `{}`, and 1Password resolves a duplicate \
+                 title by returning the first match. Include {{project}} or {{profile}} in the \
+                 template, or give each project its own vault",
+                self.template.as_str(),
+                self.get_vault_name()
+            )));
+        }
         Ok(crate::config::NativeAddress {
-            item: self.format_item_name(project, key, profile),
+            item: self.template.render(project, profile, key),
             vault: Some(self.get_vault_name()),
             ..Default::default()
         })
@@ -894,6 +918,15 @@ impl Provider for OnePasswordProvider {
             if let Some(ref vault) = self.config.default_vault {
                 uri.push_str(&ProviderUrl::encode(vault));
             }
+        }
+
+        // Rendered from the template rather than the config field, so the URI
+        // can never disagree with the titles the provider actually resolves.
+        if !self.template.is_convention() {
+            uri.push('?');
+            uri.push_str(crate::provider::TEMPLATE_QUERY);
+            uri.push('=');
+            uri.push_str(&ProviderUrl::encode_query(self.template.as_str()));
         }
 
         uri
@@ -1197,6 +1230,71 @@ mod tests {
 
     fn config_err(s: &str) -> SecretSpecError {
         OnePasswordConfig::try_from(&ProviderUrl::new(Url::parse(s).unwrap())).unwrap_err()
+    }
+
+    /// Before the uniform `?template=`, this provider's title template was
+    /// reachable from the Rust API only: the URI path names the vault, so
+    /// there was nowhere in it to spell one.
+    #[test]
+    fn template_query_sets_the_item_title_template() {
+        let config = config("onepassword://Production?template=team/{project}/{profile}/{key}");
+        assert_eq!(
+            config.folder_prefix.as_deref(),
+            Some("team/{project}/{profile}/{key}")
+        );
+        assert_eq!(config.default_vault.as_deref(), Some("Production"));
+    }
+
+    #[test]
+    fn template_query_round_trips_through_uri() {
+        let provider = OnePasswordProvider::new(config(
+            "onepassword://Production?template=team/{project}/{profile}/{key}",
+        ));
+        // Braces survive unescaped: `QUERY_ENCODE_SET` leaves them literal, so
+        // the round-tripped URI reads the way the user wrote it.
+        assert_eq!(
+            provider.uri(),
+            "onepassword://Production?template=team/{project}/{profile}/{key}"
+        );
+        assert_eq!(
+            OnePasswordConfig::try_from(&ProviderUrl::new(Url::parse(&provider.uri()).unwrap()))
+                .unwrap()
+                .folder_prefix
+                .as_deref(),
+            Some("team/{project}/{profile}/{key}"),
+            "the emitted URI must parse back to the same template"
+        );
+    }
+
+    #[test]
+    fn default_template_is_omitted_from_the_uri() {
+        let provider = OnePasswordProvider::new(config("onepassword://Production"));
+        assert_eq!(provider.uri(), "onepassword://Production");
+    }
+
+    /// 1Password addresses by title and resolves a duplicate by returning the
+    /// first match, so a template that renders one title across projects reads
+    /// an unrelated item instead of failing. Refused rather than rendered.
+    #[test]
+    fn refuses_a_template_that_does_not_scope_by_project_or_profile() {
+        let provider = OnePasswordProvider::new(config("onepassword://Shared?template={key}"));
+        let error = provider
+            .convention_address("myproj", "production", "DATABASE_URL")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("same item title"), "{message}");
+        assert!(message.contains("Shared"), "{message}");
+    }
+
+    #[test]
+    fn accepts_a_template_scoped_by_project_alone() {
+        let provider =
+            OnePasswordProvider::new(config("onepassword://Shared?template={project}/{key}"));
+        let address = provider
+            .convention_address("myproj", "production", "DATABASE_URL")
+            .unwrap();
+        assert_eq!(address.item, "myproj/DATABASE_URL");
+        assert_eq!(address.vault.as_deref(), Some("Shared"));
     }
 
     /// Every URI shape that used to be an instance-level reference now errors

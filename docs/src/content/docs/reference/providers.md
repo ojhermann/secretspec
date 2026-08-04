@@ -9,6 +9,46 @@ This page is a compact URI reference. For installation, authentication,
 copyable project configuration, storage behavior, and CI/CD guidance, follow
 the link for the individual provider.
 
+## Naming templates (`?template=`) (0.18+)
+
+:::caution[Version compatibility]
+The uniform `?template=` query parameter is added in SecretSpec 0.18. Earlier
+versions spell the template per provider — see the table below, which keeps
+working.
+:::
+
+Providers that name a secret with a single string — a keyring service, a `pass`
+entry, an item title — render it from a naming template. The template supports
+`{project}`, `{profile}` and `{key}`; anything else is literal text. The default
+is `secretspec/{project}/{profile}/{key}` (Proton Pass omits the leading
+`secretspec/`, since its vault already scopes the items).
+
+```bash
+keyring://?template=team/{profile}/{key}
+onepassword://Production?template=secretspec/{project}/{profile}/{key}
+kdbx:./vault.kdbx?template={key}
+```
+
+A flat layout is just a template that drops the folders: `?template={key}`.
+
+Each provider's older spelling still works, and naming the template both ways in
+one URI is an error rather than one silently winning:
+
+| Provider | Older spelling | Uniform spelling |
+|---|---|---|
+| `keyring`, `pass`, `gopass`, `lastpass` | URI host and path | `?template=` |
+| `protonpass` | URI path after the vault | `?template=` |
+| `kdbx` | `?prefix=` | `?template=` |
+| `onepassword` | *(none — Rust API only)* | `?template=` |
+
+**Not every template is safe in every store.** Where the URI already names a
+per-project container — a KDBX file, a `pass` store — dropping `{project}` and
+`{profile}` merely flattens the layout. Where it does not, the same template
+merges projects onto one name. 1Password addresses by item title and resolves a
+duplicate title by returning the first match, so it refuses a template that
+varies by neither `{project}` nor `{profile}` rather than reading an unrelated
+item.
+
 ## DotEnv Provider
 
 **URI**: `dotenv://[path]` - Stores secrets in `.env` files
@@ -87,7 +127,7 @@ operating-system username as the account
 The `kdbx` provider is added in SecretSpec 0.17.
 :::
 
-**URI**: `kdbx:PATH[?keyfile=PATH][&prefix=TEMPLATE]` - Stores secrets in a
+**URI**: `kdbx:PATH[?keyfile=PATH][&template=TEMPLATE]` - Stores secrets in a
 KeePass-compatible encrypted database
 
 ```bash
@@ -156,6 +196,7 @@ apply to it and those reads sync hourly.
 onepassword://MyVault                           # Default account
 onepassword://work@CompanyVault                 # Specific account
 onepassword+token://user:op_token@SecureVault   # Service account
+onepassword://Shared?template={project}/{key}   # Custom item title (0.18+)
 ```
 
 **Features**: Read/write, cloud sync, profiles via vaults, service accounts

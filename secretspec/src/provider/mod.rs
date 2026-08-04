@@ -305,6 +305,7 @@ pub mod scaleway;
 #[cfg(feature = "sops")]
 pub mod sops;
 pub mod systemd_credential;
+pub mod template;
 #[cfg(feature = "vault")]
 pub mod vault;
 #[cfg(any(feature = "openbao", feature = "vault"))]
@@ -454,6 +455,39 @@ pub(crate) fn flat_item<'a, P: Provider + ?Sized>(
 /// Macro support types
 pub use macros::{PROVIDER_REGISTRY, ProviderRegistration, declared_flag};
 
+pub use template::NameTemplate;
+
+/// The uniform URI spelling for a provider's naming template.
+pub(crate) const TEMPLATE_QUERY: &str = "template";
+
+/// Reads the uniform `?template=` knob, reconciling it with the older
+/// per-provider spelling the same URI may use.
+///
+/// Every store that names a secret with one string answers the same question,
+/// so it takes the same query parameter. The older spellings differ only
+/// because each provider's URI *path* was already spoken for by something else
+/// — a KDBX file, a 1Password vault — which is why the uniform knob is a query
+/// parameter and not a path: it is the one slot free on every provider.
+///
+/// `legacy` is whatever the provider parsed from its own older spelling, and
+/// `legacy_spelling` names that spelling in the error a URI using both gets.
+/// Spelling it twice is refused rather than resolved by precedence, because
+/// either choice silently ignores something the user wrote.
+pub(crate) fn template_from_url(
+    url: &ProviderUrl,
+    legacy: Option<String>,
+    legacy_spelling: &str,
+) -> Result<Option<String>> {
+    match (url.query_value(TEMPLATE_QUERY), legacy) {
+        (Some(_), Some(_)) => Err(SecretSpecError::ProviderOperationFailed(format!(
+            "naming template given twice: as ?{TEMPLATE_QUERY}= and as {legacy_spelling}. \
+             Use one or the other"
+        ))),
+        (Some(template), None) => Ok(Some(template)),
+        (None, legacy) => Ok(legacy),
+    }
+}
+
 /// Returns a list of all available providers with their metadata.
 ///
 /// This includes the provider name, description, and example URIs for each
@@ -577,6 +611,19 @@ pub(crate) fn provider_display_name_for_spec(spec: &str) -> String {
 /// - Providers may choose to be read-only by overriding [`check_writable`](Provider::check_writable)
 /// - Provider names should be lowercase and descriptive
 pub trait Provider: Send + Sync {
+    /// The template convention addresses are rendered through, defaulting to
+    /// `secretspec/{project}/{profile}/{key}`.
+    ///
+    /// A store whose names are a single string — an item title, an entry path,
+    /// a keyring service — declares its template here and inherits
+    /// [`convention_address`](Provider::convention_address) whole. A store that
+    /// addresses in more than one part (a Vault mount plus a path, an Infisical
+    /// environment plus a folder) overrides `convention_address` instead, and
+    /// renders this template for the name portion.
+    fn name_template(&self) -> &NameTemplate {
+        NameTemplate::convention()
+    }
+
     /// Compiles SecretSpec's `{project}/{profile}/{key}` naming convention into
     /// this store's native coordinates: the same address space a secret's
     /// `ref` uses.
@@ -586,11 +633,42 @@ pub trait Provider: Send + Sync {
     /// every address through [`resolve_coords`](Provider::resolve_coords) and
     /// never re-derive names. Pure naming, no I/O.
     ///
+    /// The default renders [`name_template`](Provider::name_template) into the
+    /// `item` coordinate, which is the whole of the answer for a store that
+    /// names a secret with one string. Overriding it is for stores that do not:
+    /// a name needing validation or encoding to be legal, or coordinates beyond
+    /// `item`.
+    ///
+    /// # Refusing a template
+    ///
+    /// The template mechanism is uniform; what a given store can *address*
+    /// safely is not. This is where a provider says so — it has the rendered
+    /// name and returns [`Result`], so it can reject one it cannot resolve
+    /// unambiguously. Two kinds of refusal exist today:
+    ///
+    /// - a name that is not legal in the store —
+    ///   [`kdbx`](kdbx::KdbxProvider) parses the rendered prefix as a group
+    ///   path and fails early rather than at operation time;
+    /// - a name that is legal but *ambiguous* —
+    ///   [`onepassword`](onepassword::OnePasswordProvider) refuses a template
+    ///   that does not vary by project or profile, because it addresses by
+    ///   title and resolves a duplicate title by returning the first match.
+    ///
+    /// The distinction that decides it is whether the URI already names a
+    /// per-project container. Where it does, a template that drops
+    /// `{project}`/`{profile}` merely flattens the layout; where it does not,
+    /// the same template silently merges projects.
+    ///
     /// # Errors
     ///
     /// Returns an error when the convention inputs cannot form a valid name in
     /// this store (e.g. empty components, length limits).
-    fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress>;
+    fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
+        Ok(NativeAddress {
+            item: self.name_template().render(project, profile, key),
+            ..Default::default()
+        })
+    }
 
     /// The optional [`NativeAddress`] coordinates this store can honor, beyond
     /// the universally consumed `item` (e.g. `["field"]`).
@@ -937,6 +1015,9 @@ pub(crate) fn get_each<P: Provider + ?Sized>(
 }
 
 impl<T: Provider> Provider for std::sync::Arc<T> {
+    fn name_template(&self) -> &NameTemplate {
+        (**self).name_template()
+    }
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
         (**self).convention_address(project, profile, key)
     }
@@ -1097,6 +1178,11 @@ impl PreflightGuard {
 }
 
 impl Provider for PreflightGuard {
+    fn name_template(&self) -> &NameTemplate {
+        // Pure naming, no I/O: needs no auth preflight.
+        self.inner.name_template()
+    }
+
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
         // Pure naming, no I/O: needs no auth preflight.
         self.inner.convention_address(project, profile, key)

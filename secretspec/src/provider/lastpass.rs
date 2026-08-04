@@ -1,4 +1,4 @@
-use crate::provider::{Address, Provider, ProviderUrl};
+use crate::provider::{Address, NameTemplate, Provider, ProviderUrl};
 use crate::{Result, SecretSpecError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -57,13 +57,11 @@ impl TryFrom<&ProviderUrl> for LastPassConfig {
             )));
         }
 
-        let mut config = Self::default();
+        let path_spelling = url.host().map(|host| format!("{}{}", host, url.path()));
 
-        if let Some(host) = url.host() {
-            config.folder_prefix = Some(format!("{}{}", host, url.path()));
-        }
-
-        Ok(config)
+        Ok(Self {
+            folder_prefix: crate::provider::template_from_url(url, path_spelling, "the URI path")?,
+        })
     }
 }
 
@@ -99,6 +97,7 @@ impl TryFrom<&ProviderUrl> for LastPassConfig {
 pub struct LastPassProvider {
     #[allow(dead_code)]
     config: LastPassConfig,
+    template: NameTemplate,
 }
 
 crate::register_provider! {
@@ -118,7 +117,12 @@ impl LastPassProvider {
     ///
     /// * `config` - The LastPass configuration to use
     pub fn new(config: LastPassConfig) -> Self {
-        Self { config }
+        let template = config
+            .folder_prefix
+            .as_deref()
+            .map(NameTemplate::new)
+            .unwrap_or_default();
+        Self { config, template }
     }
 
     /// Executes a LastPass CLI command and returns its output.
@@ -177,34 +181,6 @@ impl LastPassProvider {
         })
     }
 
-    /// Formats the item name for storage in LastPass.
-    ///
-    /// Creates a hierarchical path for organizing secrets within LastPass.
-    /// Uses folder_prefix as a format string with {project}, {profile}, and {key} placeholders.
-    /// Defaults to "secretspec/{project}/{profile}/{key}" if not configured.
-    ///
-    /// # Arguments
-    ///
-    /// * `project` - The project name
-    /// * `key` - The secret key name
-    /// * `profile` - The profile name (e.g., "default", "production", "staging")
-    ///
-    /// # Returns
-    ///
-    /// A formatted string representing the full path to the secret in LastPass.
-    fn format_item_name(&self, project: &str, key: &str, profile: &str) -> String {
-        let format_string = self
-            .config
-            .folder_prefix
-            .as_deref()
-            .unwrap_or("secretspec/{project}/{profile}/{key}");
-
-        format_string
-            .replace("{project}", project)
-            .replace("{profile}", profile)
-            .replace("{key}", key)
-    }
-
     /// Checks the current LastPass login status.
     ///
     /// Executes `lpass status` to determine if the user is currently logged in.
@@ -240,18 +216,10 @@ impl LastPassProvider {
 }
 
 impl Provider for LastPassProvider {
-    /// Convention items live under the folder-prefix format string,
+    /// Convention items live under the folder-prefix template,
     /// `secretspec/{project}/{profile}/{key}` by default.
-    fn convention_address(
-        &self,
-        project: &str,
-        profile: &str,
-        key: &str,
-    ) -> Result<crate::config::NativeAddress> {
-        Ok(crate::config::NativeAddress {
-            item: self.format_item_name(project, key, profile),
-            ..Default::default()
-        })
+    fn name_template(&self) -> &NameTemplate {
+        &self.template
     }
 
     fn name(&self) -> &'static str {

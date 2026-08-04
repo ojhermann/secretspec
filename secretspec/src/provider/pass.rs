@@ -1,4 +1,4 @@
-use super::{Address, Provider, ProviderUrl};
+use super::{Address, NameTemplate, Provider, ProviderUrl};
 use crate::{Result, SecretSpecError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -40,17 +40,12 @@ impl TryFrom<&ProviderUrl> for PassConfig {
             )));
         }
 
-        let mut config = Self {
+        let path_spelling = url.host().map(|host| format!("{}{}", host, url.path()));
+
+        Ok(Self {
             store_dir: url.query_value("store_dir"),
-            ..Self::default()
-        };
-
-        if let Some(host) = url.host() {
-            let path = url.path();
-            config.folder_prefix = Some(format!("{}{}", host, path));
-        }
-
-        Ok(config)
+            folder_prefix: super::template_from_url(url, path_spelling, "the URI path")?,
+        })
     }
 }
 
@@ -74,6 +69,7 @@ impl TryFrom<&ProviderUrl> for PassConfig {
 /// - The password store must be initialized (`pass init`)
 pub struct PassProvider {
     config: PassConfig,
+    template: NameTemplate,
 }
 
 crate::register_provider! {
@@ -89,24 +85,12 @@ crate::register_provider! {
 impl PassProvider {
     /// Creates a new PassProvider with the given configuration.
     pub fn new(config: PassConfig) -> Self {
-        Self { config }
-    }
-
-    /// Formats the entry name for a secret.
-    ///
-    /// Uses folder_prefix as a format string with {project}, {profile}, and {key} placeholders.
-    /// Defaults to "secretspec/{project}/{profile}/{key}" if not configured.
-    fn format_entry_name(&self, project: &str, profile: &str, key: &str) -> String {
-        let format_string = self
-            .config
+        let template = config
             .folder_prefix
             .as_deref()
-            .unwrap_or("secretspec/{project}/{profile}/{key}");
-
-        format_string
-            .replace("{project}", project)
-            .replace("{profile}", profile)
-            .replace("{key}", key)
+            .map(NameTemplate::new)
+            .unwrap_or_default();
+        Self { config, template }
     }
 
     /// Creates a `pass` command, applying `PASSWORD_STORE_DIR` when a custom
@@ -121,18 +105,10 @@ impl PassProvider {
 }
 
 impl Provider for PassProvider {
-    /// Convention entries live under the folder-prefix format string,
+    /// Convention entries live under the folder-prefix template,
     /// `secretspec/{project}/{profile}/{key}` by default.
-    fn convention_address(
-        &self,
-        project: &str,
-        profile: &str,
-        key: &str,
-    ) -> Result<crate::config::NativeAddress> {
-        Ok(crate::config::NativeAddress {
-            item: self.format_entry_name(project, profile, key),
-            ..Default::default()
-        })
+    fn name_template(&self) -> &NameTemplate {
+        &self.template
     }
 
     fn name(&self) -> &'static str {
@@ -313,13 +289,17 @@ mod tests {
         ProviderUrl::new(Url::parse(s).unwrap())
     }
 
+    fn entry_name(provider: &PassProvider) -> String {
+        provider
+            .convention_address("myproj", "prod", "API_KEY")
+            .unwrap()
+            .item
+    }
+
     #[test]
     fn format_entry_name_default_pattern() {
         let provider = PassProvider::new(PassConfig::default());
-        assert_eq!(
-            provider.format_entry_name("myproj", "prod", "API_KEY"),
-            "secretspec/myproj/prod/API_KEY"
-        );
+        assert_eq!(entry_name(&provider), "secretspec/myproj/prod/API_KEY");
     }
 
     #[test]
@@ -328,10 +308,7 @@ mod tests {
             folder_prefix: Some("vault/{profile}/{key}".to_string()),
             store_dir: None,
         });
-        assert_eq!(
-            provider.format_entry_name("myproj", "prod", "API_KEY"),
-            "vault/prod/API_KEY"
-        );
+        assert_eq!(entry_name(&provider), "vault/prod/API_KEY");
     }
 
     #[test]

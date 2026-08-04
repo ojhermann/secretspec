@@ -1,4 +1,4 @@
-use super::{Address, Provider, ProviderUrl};
+use super::{Address, NameTemplate, Provider, ProviderUrl};
 use crate::{Result, SecretSpecError};
 use keyring::Entry;
 use secrecy::{ExposeSecret, SecretString};
@@ -34,13 +34,11 @@ impl TryFrom<&ProviderUrl> for KeyringConfig {
             )));
         }
 
-        let mut config = Self::default();
+        let path_spelling = url.host().map(|host| format!("{}{}", host, url.path()));
 
-        if let Some(host) = url.host() {
-            config.folder_prefix = Some(format!("{}{}", host, url.path()));
-        }
-
-        Ok(config)
+        Ok(Self {
+            folder_prefix: super::template_from_url(url, path_spelling, "the URI path")?,
+        })
     }
 }
 
@@ -59,6 +57,7 @@ impl TryFrom<&ProviderUrl> for KeyringConfig {
 /// preventing conflicts between different projects or environments.
 pub struct KeyringProvider {
     config: KeyringConfig,
+    template: NameTemplate,
 }
 
 crate::register_provider! {
@@ -82,24 +81,12 @@ impl KeyringProvider {
     ///
     /// A new instance of KeyringProvider
     pub fn new(config: KeyringConfig) -> Self {
-        Self { config }
-    }
-
-    /// Formats the service name for a secret in the keyring.
-    ///
-    /// Uses folder_prefix as a format string with {project}, {profile}, and {key} placeholders.
-    /// Defaults to "secretspec/{project}/{profile}/{key}" if not configured.
-    fn format_service(&self, project: &str, profile: &str, key: &str) -> String {
-        let format_string = self
-            .config
+        let template = config
             .folder_prefix
             .as_deref()
-            .unwrap_or("secretspec/{project}/{profile}/{key}");
-
-        format_string
-            .replace("{project}", project)
-            .replace("{profile}", profile)
-            .replace("{key}", key)
+            .map(NameTemplate::new)
+            .unwrap_or_default();
+        Self { config, template }
     }
 
     /// Resolves the `(service, account)` an operation targets: `item` is the
@@ -126,19 +113,11 @@ impl KeyringProvider {
 }
 
 impl Provider for KeyringProvider {
-    /// Convention entries use the folder-prefix format string as the service
-    /// name, `secretspec/{project}/{profile}/{key}` by default; the account
-    /// (the `field` coordinate) is resolved at operation time.
-    fn convention_address(
-        &self,
-        project: &str,
-        profile: &str,
-        key: &str,
-    ) -> Result<crate::config::NativeAddress> {
-        Ok(crate::config::NativeAddress {
-            item: self.format_service(project, profile, key),
-            ..Default::default()
-        })
+    /// Convention entries use the folder-prefix template as the service name,
+    /// `secretspec/{project}/{profile}/{key}` by default; the account (the
+    /// `field` coordinate) is resolved at operation time.
+    fn name_template(&self) -> &NameTemplate {
+        &self.template
     }
 
     /// `field` is the keyring account within the service entry.
@@ -208,13 +187,43 @@ mod tests {
         ProviderUrl::new(Url::parse(s).unwrap())
     }
 
+    fn service_name(provider: &KeyringProvider) -> String {
+        provider
+            .convention_address("myproj", "prod", "API_KEY")
+            .unwrap()
+            .item
+    }
+
+    /// The path spelling this provider has always used still works; the
+    /// uniform `?template=` is an alias for it.
+    #[test]
+    fn path_and_template_query_are_the_same_template() {
+        let from_path = KeyringConfig::try_from(&provider_url("keyring://team/{profile}/{key}"))
+            .unwrap()
+            .folder_prefix;
+        let from_query =
+            KeyringConfig::try_from(&provider_url("keyring://?template=team/{profile}/{key}"))
+                .unwrap()
+                .folder_prefix;
+        assert_eq!(from_path.as_deref(), Some("team/{profile}/{key}"));
+        assert_eq!(from_path, from_query);
+    }
+
+    /// Refused rather than resolved by precedence: either choice would
+    /// silently ignore something the user wrote.
+    #[test]
+    fn path_and_template_query_together_are_refused() {
+        let error =
+            KeyringConfig::try_from(&provider_url("keyring://team/{key}?template=other/{key}"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("given twice"), "{error}");
+    }
+
     #[test]
     fn format_service_default_pattern() {
         let provider = KeyringProvider::new(KeyringConfig::default());
-        assert_eq!(
-            provider.format_service("myproj", "prod", "API_KEY"),
-            "secretspec/myproj/prod/API_KEY"
-        );
+        assert_eq!(service_name(&provider), "secretspec/myproj/prod/API_KEY");
     }
 
     #[test]
@@ -222,10 +231,7 @@ mod tests {
         let provider = KeyringProvider::new(KeyringConfig {
             folder_prefix: Some("vault/{profile}/{key}".to_string()),
         });
-        assert_eq!(
-            provider.format_service("myproj", "prod", "API_KEY"),
-            "vault/prod/API_KEY"
-        );
+        assert_eq!(service_name(&provider), "vault/prod/API_KEY");
     }
 
     #[test]

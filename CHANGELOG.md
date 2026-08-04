@@ -15,8 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The dotenv provider's "cannot store" error now tells you to rename the secret
   in `secretspec.toml` when the name came from a manifest declaration, instead
   of always pointing at a `ref` item the config may not contain.
+- Providers that render a configurable item-name format string (keyring, pass,
+  gopass, LastPass, Proton Pass, KDBX, 1Password) no longer substitute a second
+  time into a value that itself looks like a placeholder, so a project or
+  profile named `{key}` now resolves to the name you configured.
 
 ### Added
+- Providers that name a secret with a single string (keyring, pass, gopass,
+  LastPass, Proton Pass, KDBX, 1Password) now take their naming template from a
+  uniform `?template=` query parameter, so `{project}`, `{profile}` and `{key}`
+  are spelled the same way everywhere. A flat layout is `?template={key}`. Each
+  provider's older spelling keeps working — the URI host and path for keyring,
+  pass, gopass and LastPass, the path after the vault for Proton Pass, and
+  `?prefix=` for KDBX — and giving both in one URI is an error rather than one
+  silently winning. The 1Password provider gains a URI spelling for its item
+  title for the first time; it previously had one only through the Rust API.
+  1Password refuses a template that varies by neither `{project}` nor
+  `{profile}`, because it addresses items by title and resolves a duplicate
+  title by returning the first match, which would read an unrelated item.
 - Dashlane provider (`dashlane://`) for reading secrets from a Dashlane vault
   through the `dcli` CLI. Convention secrets read the item titled
   `secretspec/{project}/{profile}/{key}`, and a `ref` names an existing item by

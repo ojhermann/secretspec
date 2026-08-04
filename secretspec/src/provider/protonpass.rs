@@ -1,4 +1,4 @@
-use crate::provider::{Address, Provider, ProviderUrl};
+use crate::provider::{Address, NameTemplate, Provider, ProviderUrl};
 use crate::{Result, SecretSpecError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,10 @@ use std::sync::Mutex;
 /// non-agent sessions and older pass-cli releases it is ignored, so setting it
 /// unconditionally is safe and backward compatible.
 const AGENT_REASON_ENV: &str = "PROTON_PASS_AGENT_REASON";
+
+/// Item title rendered when the URI names no template. The vault is the
+/// container here, so the title needs no `secretspec/` segment of its own.
+const DEFAULT_TITLE_TEMPLATE: &str = "{project}/{profile}/{key}";
 
 /// Reason recorded in Proton Pass' agent audit log when neither a session reason
 /// (via `Secrets::with_reason`) nor `PROTON_PASS_AGENT_REASON` is provided.
@@ -122,9 +126,9 @@ impl TryFrom<&ProviderUrl> for ProtonPassConfig {
 
         let path = url.path();
         let path = path.trim_start_matches('/');
-        if !path.is_empty() {
-            config.title_template = Some(path.to_string());
-        }
+        let path_spelling = (!path.is_empty()).then(|| path.to_string());
+        config.title_template =
+            crate::provider::template_from_url(url, path_spelling, "the URI path")?;
 
         Ok(config)
     }
@@ -149,6 +153,9 @@ impl TryFrom<&ProviderUrl> for ProtonPassConfig {
 /// Item title: `{project}/{profile}/{key}` by default, customizable via the URI path.
 pub struct ProtonPassProvider {
     config: ProtonPassConfig,
+    /// Item title template. The vault is the container here, so the default
+    /// carries no `secretspec/` segment.
+    template: NameTemplate,
     /// Path to `pass-cli` binary.
     /// Override with the `SECRETSPEC_PROTONPASS_CLI_PATH` environment variable.
     cli_binary_path: String,
@@ -176,8 +183,13 @@ impl ProtonPassProvider {
     pub fn new(config: ProtonPassConfig) -> Self {
         let cli_binary_path = std::env::var("SECRETSPEC_PROTONPASS_CLI_PATH")
             .unwrap_or_else(|_| "pass-cli".to_string());
+        let template = config.title_template.as_deref().map_or_else(
+            || NameTemplate::new(DEFAULT_TITLE_TEMPLATE),
+            NameTemplate::new,
+        );
         Self {
             config,
+            template,
             cli_binary_path,
             session_reason: Mutex::new(None),
         }
@@ -218,18 +230,6 @@ impl ProtonPassProvider {
 
     fn get_vault_name(&self) -> &str {
         self.config.vault_name.as_deref().unwrap_or("secretspec")
-    }
-
-    fn format_item_title(&self, project: &str, profile: &str, key: &str) -> String {
-        let template = self
-            .config
-            .title_template
-            .as_deref()
-            .unwrap_or("{project}/{profile}/{key}");
-        template
-            .replace("{project}", project)
-            .replace("{profile}", profile)
-            .replace("{key}", key)
     }
 
     /// Builds a `pass-cli` command with the agent-session reason wired in.
@@ -305,17 +305,10 @@ impl ProtonPassProvider {
 
 impl Provider for ProtonPassProvider {
     /// Convention items are titled by the title template,
-    /// `{project}/{profile}/{key}` by default.
-    fn convention_address(
-        &self,
-        project: &str,
-        profile: &str,
-        key: &str,
-    ) -> Result<crate::config::NativeAddress> {
-        Ok(crate::config::NativeAddress {
-            item: self.format_item_title(project, profile, key),
-            ..Default::default()
-        })
+    /// `{project}/{profile}/{key}` by default: the vault already scopes the
+    /// items, so the title carries no `secretspec/` segment.
+    fn name_template(&self) -> &NameTemplate {
+        &self.template
     }
 
     fn name(&self) -> &'static str {

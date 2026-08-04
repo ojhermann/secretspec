@@ -1,5 +1,4 @@
-use crate::config::NativeAddress;
-use crate::provider::{Address, ProviderUrl};
+use crate::provider::{Address, NameTemplate, ProviderUrl};
 use crate::{Provider, SecretSpecError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -34,19 +33,17 @@ impl TryFrom<&ProviderUrl> for GoPassConfig {
             )));
         }
 
-        let mut config = Self::default();
+        let path_spelling = url.host().map(|host| format!("{}{}", host, url.path()));
 
-        if let Some(host) = url.host() {
-            let path = url.path();
-            config.folder_prefix = Some(format!("{}{}", host, path));
-        }
-
-        Ok(config)
+        Ok(Self {
+            folder_prefix: crate::provider::template_from_url(url, path_spelling, "the URI path")?,
+        })
     }
 }
 
 pub struct GoPassProvider {
     config: GoPassConfig,
+    template: NameTemplate,
 }
 
 /// Whether a failed `gopass` invocation failed only because the entry is not in
@@ -73,24 +70,12 @@ crate::register_provider! {
 impl GoPassProvider {
     /// Creates a new GoPassProvider with the given configuration.
     pub fn new(config: GoPassConfig) -> Self {
-        Self { config }
-    }
-
-    /// Formats the entry name for a secret.
-    ///
-    /// Uses folder_prefix as a format string with {project}, {profile}, and {key} placeholders.
-    /// Defaults to "secretspec/{project}/{profile}/{key}" if not configured.
-    fn format_entry_name(&self, project: &str, profile: &str, key: &str) -> String {
-        let format_string = self
-            .config
+        let template = config
             .folder_prefix
             .as_deref()
-            .unwrap_or("secretspec/{project}/{profile}/{key}");
-
-        format_string
-            .replace("{project}", project)
-            .replace("{profile}", profile)
-            .replace("{key}", key)
+            .map(NameTemplate::new)
+            .unwrap_or_default();
+        Self { config, template }
     }
 
     /// Creates a `gopass` command
@@ -100,18 +85,10 @@ impl GoPassProvider {
 }
 
 impl Provider for GoPassProvider {
-    /// Convention entries live under the folder-prefix format string,
+    /// Convention entries live under the folder-prefix template,
     /// `secretspec/{project}/{profile}/{key}` by default.
-    fn convention_address(
-        &self,
-        project: &str,
-        profile: &str,
-        key: &str,
-    ) -> crate::Result<NativeAddress> {
-        Ok(crate::config::NativeAddress {
-            item: self.format_entry_name(project, profile, key),
-            ..Default::default()
-        })
+    fn name_template(&self) -> &NameTemplate {
+        &self.template
     }
 
     /// Retrieves a secret from the password store.
@@ -299,13 +276,17 @@ mod tests {
         ProviderUrl::new(Url::parse(s).unwrap())
     }
 
+    fn entry_name(provider: &GoPassProvider) -> String {
+        provider
+            .convention_address("myproj", "prod", "API_KEY")
+            .unwrap()
+            .item
+    }
+
     #[test]
     fn format_entry_name_default_pattern() {
         let provider = GoPassProvider::new(GoPassConfig::default());
-        assert_eq!(
-            provider.format_entry_name("myproj", "prod", "API_KEY"),
-            "secretspec/myproj/prod/API_KEY"
-        );
+        assert_eq!(entry_name(&provider), "secretspec/myproj/prod/API_KEY");
     }
 
     #[test]
@@ -313,10 +294,7 @@ mod tests {
         let provider = GoPassProvider::new(GoPassConfig {
             folder_prefix: Some("team-store/{profile}/{key}".to_string()),
         });
-        assert_eq!(
-            provider.format_entry_name("myproj", "prod", "API_KEY"),
-            "team-store/prod/API_KEY"
-        );
+        assert_eq!(entry_name(&provider), "team-store/prod/API_KEY");
     }
 
     #[test]

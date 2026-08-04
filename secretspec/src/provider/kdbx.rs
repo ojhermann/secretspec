@@ -5,7 +5,7 @@
 //! supplies that complete path as `item`. The entry's `Password` field is used
 //! by default, while `field` can select another standard or custom field.
 
-use super::{Address, Provider, ProviderCredentials, ProviderUrl, credential_or_env};
+use super::{Address, NameTemplate, Provider, ProviderCredentials, ProviderUrl, credential_or_env};
 use crate::config::NativeAddress;
 use crate::{Result, SecretSpecError};
 use keepass::DatabaseKey;
@@ -19,7 +19,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const DEFAULT_PREFIX: &str = "secretspec/{project}/{profile}/{key}";
+const DEFAULT_PREFIX: &str = super::template::CONVENTION;
 const PASSWORD_CREDENTIAL: &str = "password";
 const PASSWORD_ENV: &str = "SECRETSPEC_KDBX_PASSWORD";
 
@@ -82,23 +82,27 @@ impl TryFrom<&ProviderUrl> for KdbxConfig {
                     }
                     keyfile = Some(PathBuf::from(value));
                 }
-                "prefix" => {
+                // `prefix` is this provider's older spelling of the naming
+                // template, kept working; `template` is the uniform one.
+                name @ ("prefix" | super::TEMPLATE_QUERY) => {
                     if prefix.is_some() {
                         return Err(operation_error(
-                            "The KDBX `prefix` query parameter may only be specified once.",
+                            "The KDBX naming template may only be specified once, as either \
+                             `prefix` or `template`.",
                         ));
                     }
                     if value.is_empty() {
-                        return Err(operation_error(
-                            "The KDBX `prefix` query parameter cannot be empty.",
-                        ));
+                        return Err(operation_error(format!(
+                            "The KDBX `{name}` query parameter cannot be empty."
+                        )));
                     }
                     prefix = Some(value);
                 }
                 other => {
                     return Err(operation_error(format!(
                         "Unknown KDBX query parameter `{other}`. Supported parameters are \
-                         `keyfile` and `prefix`."
+                         `keyfile`, `template`, and `prefix` (the older spelling of \
+                         `template`)."
                     )));
                 }
             }
@@ -118,6 +122,7 @@ impl TryFrom<&ProviderUrl> for KdbxConfig {
 /// update existing KDBX 4 databases; the `keepass` crate cannot save KDBX 3.
 pub struct KdbxProvider {
     config: KdbxConfig,
+    template: NameTemplate,
     credentials: ProviderCredentials,
 }
 
@@ -136,8 +141,10 @@ crate::register_provider! {
 
 impl KdbxProvider {
     pub fn new(config: KdbxConfig) -> Self {
+        let template = NameTemplate::new(config.prefix.clone());
         Self {
             config,
+            template,
             credentials: ProviderCredentials::new(),
         }
     }
@@ -267,13 +274,14 @@ impl KdbxProvider {
 }
 
 impl Provider for KdbxProvider {
+    fn name_template(&self) -> &NameTemplate {
+        &self.template
+    }
+
+    /// Overridden to check that the rendered prefix is a group path this
+    /// database can address before it reaches an operation.
     fn convention_address(&self, project: &str, profile: &str, key: &str) -> Result<NativeAddress> {
-        let item = self
-            .config
-            .prefix
-            .replace("{project}", project)
-            .replace("{profile}", profile)
-            .replace("{key}", key);
+        let item = self.template.render(project, profile, key);
         Location::parse(&item, fields::PASSWORD)?;
         Ok(NativeAddress {
             item,
@@ -383,10 +391,12 @@ impl Provider for KdbxProvider {
             uri.push_str("keyfile=");
             uri.push_str(&ProviderUrl::encode_query(&keyfile.display().to_string()));
         }
-        if self.config.prefix != DEFAULT_PREFIX {
+        // Rendered from the template rather than the config field, so the URI
+        // can never disagree with the names the provider actually resolves.
+        if !self.template.is_convention() {
             uri.push(separator);
             uri.push_str("prefix=");
-            uri.push_str(&ProviderUrl::encode_query(&self.config.prefix));
+            uri.push_str(&ProviderUrl::encode_query(self.template.as_str()));
         }
         uri
     }
@@ -550,6 +560,36 @@ mod tests {
         ProviderUrl::new(Url::parse(value).unwrap())
     }
 
+    /// `template` is the uniform spelling; `prefix` is this provider's older
+    /// one, kept working.
+    #[test]
+    fn template_query_is_an_alias_for_prefix() {
+        let config =
+            KdbxConfig::try_from(&provider_url("kdbx://./vault.kdbx?template=team/{key}")).unwrap();
+        assert_eq!(config.prefix, "team/{key}");
+    }
+
+    #[test]
+    fn template_and_prefix_together_are_refused() {
+        let error = KdbxConfig::try_from(&provider_url(
+            "kdbx://./vault.kdbx?prefix=a/{key}&template=b/{key}",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("only be specified once"), "{error}");
+    }
+
+    #[test]
+    fn empty_template_query_is_refused() {
+        let error = KdbxConfig::try_from(&provider_url("kdbx://./vault.kdbx?template="))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("`template` query parameter cannot be empty"),
+            "{error}"
+        );
+    }
+
     fn config(path: PathBuf) -> KdbxConfig {
         KdbxConfig {
             path,
@@ -700,7 +740,12 @@ mod tests {
     fn uri_round_trips_without_password() {
         let mut provider = provider(PathBuf::from("./my vault.kdbx"), "do-not-leak");
         provider.config.keyfile = Some(PathBuf::from("./my key.key"));
-        provider.config.prefix = "team/{profile}/{key}".into();
+        // Rebuilt rather than mutated: the prefix is parsed into the template
+        // at construction, so assigning to the config field alone would leave
+        // the two disagreeing.
+        let mut config = provider.config.clone();
+        config.prefix = "team/{profile}/{key}".into();
+        let provider = KdbxProvider::new(config);
         let uri = provider.uri();
         assert_eq!(
             uri,
