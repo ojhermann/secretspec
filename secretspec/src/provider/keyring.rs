@@ -15,6 +15,58 @@ pub struct KeyringConfig {
     /// Supports placeholders: {project}, {profile}, and {key}.
     /// Defaults to "secretspec/{project}/{profile}/{key}" if not specified.
     pub folder_prefix: Option<String>,
+
+    /// Which macOS keychain holds the entries. Available since SecretSpec 0.19.
+    ///
+    /// `None` uses the login keychain, which is what every platform did before
+    /// this option existed. macOS only; see [`MacKeychain`].
+    pub keychain: Option<MacKeychain>,
+}
+
+/// One of the four preference domains macOS resolves a default keychain for.
+/// Available since SecretSpec 0.19.
+///
+/// A root LaunchDaemon has no User-domain default keychain and fails with
+/// `errSecNoDefaultKeychain` (-25307), so a daemon wrapped in `secretspec run`
+/// needs `System`, which is readable by any user and writable only by root. A
+/// LaunchAgent has a login session and needs nothing here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MacKeychain {
+    User,
+    System,
+    Common,
+    Dynamic,
+}
+
+impl MacKeychain {
+    /// The name `apple-native-keyring-store` parses back, and the spelling
+    /// [`uri`](Provider::uri) emits.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::System => "System",
+            Self::Common => "Common",
+            Self::Dynamic => "Dynamic",
+        }
+    }
+}
+
+impl std::str::FromStr for MacKeychain {
+    type Err = SecretSpecError;
+
+    /// Matched case-insensitively, as the underlying store does.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "user" => Ok(Self::User),
+            "system" => Ok(Self::System),
+            "common" => Ok(Self::Common),
+            "dynamic" => Ok(Self::Dynamic),
+            other => Err(SecretSpecError::ProviderOperationFailed(format!(
+                "'{other}' is not a macOS keychain. Use User, System, Common, or Dynamic."
+            ))),
+        }
+    }
 }
 
 impl TryFrom<&ProviderUrl> for KeyringConfig {
@@ -40,6 +92,10 @@ impl TryFrom<&ProviderUrl> for KeyringConfig {
             config.folder_prefix = Some(format!("{}{}", host, url.path()));
         }
 
+        if let Some(keychain) = url.query_value("keychain") {
+            config.keychain = Some(keychain.parse()?);
+        }
+
         Ok(config)
     }
 }
@@ -59,6 +115,38 @@ impl TryFrom<&ProviderUrl> for KeyringConfig {
 /// preventing conflicts between different projects or environments.
 pub struct KeyringProvider {
     config: KeyringConfig,
+}
+
+/// An open keyring entry. `keyring::Entry` addresses the platform default
+/// store; the `keyring-core` entry carries a store modifier naming a specific
+/// macOS keychain. `keyring` re-exports `keyring_core`'s error type, so both
+/// arms fail alike.
+enum KeyringEntry {
+    Default(Entry),
+    InKeychain(keyring_core::Entry),
+}
+
+impl KeyringEntry {
+    fn get_password(&self) -> keyring::Result<String> {
+        match self {
+            Self::Default(entry) => entry.get_password(),
+            Self::InKeychain(entry) => entry.get_password(),
+        }
+    }
+
+    fn set_password(&self, password: &str) -> keyring::Result<()> {
+        match self {
+            Self::Default(entry) => entry.set_password(password),
+            Self::InKeychain(entry) => entry.set_password(password),
+        }
+    }
+
+    fn delete_credential(&self) -> keyring::Result<()> {
+        match self {
+            Self::Default(entry) => entry.delete_credential(),
+            Self::InKeychain(entry) => entry.delete_credential(),
+        }
+    }
 }
 
 crate::register_provider! {
@@ -114,6 +202,42 @@ impl KeyringProvider {
         Ok((coords.item.clone(), account))
     }
 
+    /// Opens the `(service, account)` entry in the configured keychain.
+    ///
+    /// Without `keychain` this is `keyring::Entry::new`, unchanged. With it,
+    /// the entry is built through `keyring-core` with a store modifier, which
+    /// the macOS store reads as the keychain to address. That path still uses
+    /// the process default store rather than installing one of its own, so it
+    /// leaves the store's one-time initialization alone.
+    fn open_entry(&self, service: &str, account: &str) -> Result<KeyringEntry> {
+        let Some(keychain) = self.config.keychain else {
+            return Ok(KeyringEntry::Default(Entry::new(service, account)?));
+        };
+
+        if !cfg!(target_os = "macos") {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "the keychain option selects a macOS keychain ({}), and this is not macOS. \
+                 Drop `?keychain=` from the provider URI.",
+                keychain.as_str()
+            )));
+        }
+
+        // The default store is installed by `keyring`'s own one-time
+        // initialization, which only runs on the paths it owns. `store_status`
+        // is the documented way to force it without building an entry, and
+        // without it the first modifier entry would fail with NoDefaultStore.
+        Entry::store_status().as_ref().map_err(|e| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "the system keychain is unavailable: {e}"
+            ))
+        })?;
+
+        let modifiers = std::collections::HashMap::from([("keychain", keychain.as_str())]);
+        Ok(KeyringEntry::InKeychain(
+            keyring_core::Entry::new_with_modifiers(service, account, &modifiers)?,
+        ))
+    }
+
     /// The current system username, the account convention entries live under.
     fn current_username() -> Result<String> {
         whoami::username().map_err(|e| {
@@ -151,17 +275,33 @@ impl Provider for KeyringProvider {
     }
 
     fn uri(&self) -> String {
-        if let Some(ref prefix) = self.config.folder_prefix {
-            format!("keyring://{}", ProviderUrl::encode(prefix))
-        } else {
-            "keyring".to_string()
+        let prefix = self
+            .config
+            .folder_prefix
+            .as_deref()
+            .map(ProviderUrl::encode)
+            .unwrap_or_default();
+        match self.config.keychain {
+            // The keychain changes which store answers, so it has to survive
+            // into the URI: it is the cache fingerprint and the audit identity.
+            Some(keychain) => format!(
+                "keyring://{}?keychain={}",
+                prefix,
+                ProviderUrl::encode_query(keychain.as_str())
+            ),
+            None if prefix.is_empty() => "keyring".to_string(),
+            None => format!("keyring://{prefix}"),
         }
     }
 
-    /// The configured prefix selects a service entry inside the current user's
-    /// keyring; it does not select another keyring store.
+    /// The configured prefix selects a service entry inside one keyring; it
+    /// does not select another keyring store. The keychain does: entries in the
+    /// System keychain are a different container from the login keychain's.
     fn entry_container_identity(&self) -> String {
-        "keyring".to_string()
+        match self.config.keychain {
+            Some(keychain) => format!("keyring:{}", keychain.as_str()),
+            None => "keyring".to_string(),
+        }
     }
 
     /// Retrieves a secret from the system keychain.
@@ -172,7 +312,7 @@ impl Provider for KeyringProvider {
     /// The current system username is used as the account identifier.
     fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
         let (service, username) = self.entry_target(addr)?;
-        let entry = Entry::new(&service, &username)?;
+        let entry = self.open_entry(&service, &username)?;
         match entry.get_password() {
             Ok(password) => Ok(Some(SecretString::new(password.into()))),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -189,14 +329,14 @@ impl Provider for KeyringProvider {
     /// If a secret already exists with the same key, it will be overwritten.
     fn set(&self, addr: Address<'_>, value: &SecretString) -> Result<()> {
         let (service, username) = self.entry_target(addr)?;
-        let entry = Entry::new(&service, &username)?;
+        let entry = self.open_entry(&service, &username)?;
         entry.set_password(value.expose_secret())?;
         Ok(())
     }
 
     fn delete(&self, addr: Address<'_>) -> Result<bool> {
         let (service, username) = self.entry_target(addr)?;
-        let entry = Entry::new(&service, &username)?;
+        let entry = self.open_entry(&service, &username)?;
         match entry.delete_credential() {
             Ok(()) => Ok(true),
             Err(keyring::Error::NoEntry) => Ok(false),
@@ -227,6 +367,7 @@ mod tests {
     fn format_service_custom_prefix() {
         let provider = KeyringProvider::new(KeyringConfig {
             folder_prefix: Some("vault/{profile}/{key}".to_string()),
+            ..Default::default()
         });
         assert_eq!(
             provider.format_service("myproj", "prod", "API_KEY"),
@@ -265,9 +406,89 @@ mod tests {
         );
         let provider = KeyringProvider::new(KeyringConfig {
             folder_prefix: Some("my vault/{key}".to_string()),
+            ..Default::default()
         });
         // The space must be percent-encoded.
         assert_eq!(provider.uri(), "keyring://my%20vault/{key}");
+    }
+
+    #[test]
+    fn try_from_reads_the_keychain_in_any_case() {
+        for spelling in ["System", "system", "SYSTEM"] {
+            let config =
+                KeyringConfig::try_from(&provider_url(&format!("keyring://?keychain={spelling}")))
+                    .unwrap();
+            assert_eq!(config.keychain, Some(MacKeychain::System), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_a_keychain_that_is_not_a_domain() {
+        // A file-backed keychain is addressed by path, which these four
+        // preference domains cannot name -- failing here beats resolving
+        // against the login keychain as though the option were absent.
+        let err = KeyringConfig::try_from(&provider_url(
+            "keyring://?keychain=/Library/Keychains/System.keychain",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("User, System, Common"), "{err}");
+    }
+
+    #[test]
+    fn uri_round_trips_the_keychain() {
+        for spec in [
+            "keyring",
+            "keyring://secretspec/{project}/{profile}/{key}",
+            "keyring://?keychain=System",
+            "keyring://secretspec/{project}/{profile}/{key}?keychain=System",
+            "keyring://my vault/{key}?keychain=Common",
+        ] {
+            let provider = Box::<dyn Provider>::try_from(spec).expect("the spec must be valid");
+            let rendered = provider.uri();
+            let reparsed =
+                Box::<dyn Provider>::try_from(rendered.as_str()).expect("a valid rendering");
+            assert_eq!(
+                reparsed.entry_container_identity(),
+                provider.entry_container_identity(),
+                "{spec} rendered as {rendered}, which addresses another keychain",
+            );
+            assert_eq!(reparsed.uri(), rendered, "{spec} does not settle");
+        }
+    }
+
+    /// Two keychains are two containers: an entry in the System keychain is not
+    /// the entry of the same name in the login keychain.
+    #[test]
+    fn entry_container_identity_distinguishes_keychains() {
+        let identity = |keychain| {
+            KeyringProvider::new(KeyringConfig {
+                keychain,
+                ..Default::default()
+            })
+            .entry_container_identity()
+        };
+        assert_ne!(identity(Some(MacKeychain::System)), identity(None));
+        assert_ne!(
+            identity(Some(MacKeychain::System)),
+            identity(Some(MacKeychain::Common))
+        );
+        assert_eq!(identity(None), "keyring");
+    }
+
+    /// The option names a macOS keychain, so elsewhere it is refused rather
+    /// than silently resolved against whatever the platform store does have.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn opening_a_keychain_entry_is_refused_off_macos() {
+        let provider = KeyringProvider::new(KeyringConfig {
+            keychain: Some(MacKeychain::System),
+            ..Default::default()
+        });
+        let err = provider
+            .open_entry("service", "account")
+            .err()
+            .expect("a keychain cannot be opened off macOS");
+        assert!(err.to_string().contains("not macOS"), "{err}");
     }
 
     /// A native address maps `item` to the service and `field` to the account.

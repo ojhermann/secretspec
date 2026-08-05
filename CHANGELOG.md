@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Invalid SOPS path templates are now rejected when loading serialized
   provider configurations instead of being accepted without validation.
 
+### Added
+- The keyring provider accepts `?keychain=` on macOS to select which keychain
+  holds the entries — `User` (the login keychain, still the default), `System`,
+  `Common`, or `Dynamic`. A launchd daemon runs without a User-domain default
+  keychain and fails with `errSecNoDefaultKeychain`; pointing it at the System
+  keychain lets `secretspec run` wrap one. Setting the option off macOS is an
+  error rather than a silent fallback.
+
 ## [0.18.0] - 2026-08-03
 
 ### Changed

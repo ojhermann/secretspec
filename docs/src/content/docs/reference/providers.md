@@ -78,11 +78,15 @@ Gopass entries store a single line; multiline secrets are truncated to their fir
 
 ```bash
 keyring://                   # System default keychain
+keyring://?keychain=System   # macOS: the System keychain (0.19+)
 ```
 
 **Features**: Read/write, secure encryption, profiles, cross-platform
 **Storage**: Service `secretspec/{project}/{profile}/{key}`, with the current
 operating-system username as the account
+**Options**: `keychain` (0.19+, macOS only) selects the keychain — `User`
+(default), `System`, `Common`, or `Dynamic`. A LaunchDaemon has no User-domain
+default keychain, so it needs `System`; a LaunchAgent does not.
 
 ## KeePass KDBX Provider (0.17+)
 

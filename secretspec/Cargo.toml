@@ -18,6 +18,7 @@ required-features = ["cli"]
 [dependencies]
 clap.workspace = true
 keyring = { workspace = true, optional = true }
+keyring-core = { workspace = true, optional = true }
 keepass = { workspace = true, optional = true }
 keeper-secrets-manager-core = { workspace = true, optional = true }
 serde.workspace = true
@@ -58,7 +59,7 @@ age = { workspace = true, optional = true }
 [features]
 default = ["cli", "keyring", "kdbx", "keeper", "gcsm", "awssm", "awsps", "vault", "openbao", "bws", "akv", "infisical", "bw", "age", "scaleway", "sops"]
 cli = ["dep:toml_edit"]
-keyring = ["dep:keyring", "dep:whoami"]
+keyring = ["dep:keyring", "dep:keyring-core", "dep:whoami"]
 kdbx = ["dep:keepass"]
 keeper = ["dep:keeper-secrets-manager-core"]
 gcsm = ["dep:google-cloud-secretmanager-v1"]
