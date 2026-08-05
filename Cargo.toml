@@ -19,6 +19,9 @@ clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 clap_complete_nushell = "4.6"
 is_executable = "1.0"
 keyring = "4.1.6"
+# `keyring` builds entries in the default store only; addressing a specific
+# macOS keychain needs `Entry::new_with_modifiers`, which lives in core.
+keyring-core = "1.0.0"
 keepass = { version = "0.13.17", features = ["save_kdbx4"] }
 keeper-secrets-manager-core = { version = "17.3.0", default-features = false, features = ["blocking"] }
 serde = { version = "1.0", features = ["derive"] }

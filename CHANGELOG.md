@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   individually.
 - OnePassword optional references whose item names resemble authentication
   diagnostics are omitted as missing instead of aborting batch resolution.
+- The keyring provider accepts `?keychain=` on macOS to select which keychain
+  holds the entries — `User` (the login keychain, still the default), `System`,
+  `Common`, or `Dynamic`. A launchd daemon runs without a User-domain default
+  keychain and fails with `errSecNoDefaultKeychain`; pointing it at the System
+  keychain lets `secretspec run` wrap one. Setting the option off macOS is an
+  error rather than a silent fallback.
 
 ### Fixed
 

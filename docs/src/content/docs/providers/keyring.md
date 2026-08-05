@@ -59,17 +59,42 @@ $ sudo pacman -S gnome-keyring
 ### URI format
 
 ```
-keyring://[folder_prefix]
+keyring://[folder_prefix][?keychain=<domain>]
 ```
 
 - `folder_prefix`: Optional path prefix supporting `{project}`, `{profile}`, and `{key}` placeholders. Defaults to `secretspec/{project}/{profile}/{key}`.
+- `keychain` (0.20+): macOS only. Which keychain holds the entries — `User` (the login keychain, the default), `System`, `Common`, or `Dynamic`. Matched case-insensitively. Setting it on any other platform is an error.
 
 ### URI examples
 
 ```text
 keyring
 keyring://shared/{profile}/{key}
+keyring://?keychain=System                        # macOS, 0.20+
 ```
+
+### macOS: reaching secrets from a launchd daemon (0.20+)
+
+A LaunchAgent runs inside a login session and reads the login keychain
+normally, so it needs no configuration here. A **LaunchDaemon runs as root
+before any user logs in**, has no User-domain default keychain, and fails with
+`errSecNoDefaultKeychain` (-25307). Point it at the System keychain instead,
+which any user can read and only root can write:
+
+```toml title="secretspec.toml"
+[providers]
+daemon = "keyring://?keychain=System"
+```
+
+Write the secret as root so it lands in the System keychain:
+
+```bash
+$ sudo secretspec set DATABASE_URL --provider "keyring://?keychain=System"
+```
+
+The System and login keychains are separate stores: a secret written to one is
+not visible through the other, and moving between them means writing the value
+again.
 
 ### Project configuration
 
